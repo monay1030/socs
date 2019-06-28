@@ -1,28 +1,23 @@
-from ocs import ocs_agent, site_config, client_t
+from ocs import ocs_agent, site_config
 from socs.Lakeshore.Lakeshore240 import Module
-import random
 import time
-import threading
 import os
 from ocs.ocs_twisted import TimeoutLock
 from typing import Optional
 
 
-from autobahn.wamp.exception import ApplicationError
-
 class LS240_Agent:
 
-    def __init__(self, agent,
-                 port="/dev/ttyUSB0"):
+    def __init__(self, agent, port="/dev/ttyUSB0", f_sample=2.5):
 
-        self.agent = agent
+        self.agent: ocs_agent.OCSAgent = agent
         self.log = agent.log
         self.lock = TimeoutLock()
 
         self.port = port
         self.module: Optional[Module] = None
 
-        # self.thermometers = ['Channel {}'.format(i + 1) for i in range(num_channels)]
+        self.f_sample = f_sample
 
         self.initialized = False
         self.take_data = False
@@ -40,9 +35,23 @@ class LS240_Agent:
     def init_lakeshore_task(self, session, params=None):
         """
         Task to initialize Lakeshore 240 Module.
+
+        Args:
+            start_acq (bool): True if data acquisition should start immediately
+                                after initialization
         """
+        if params is None:
+            params = {}
+
+
+        start_acq = params.get('start_acq', False)
 
         if self.initialized:
+            if start_acq:
+                self.log.info("Starting acq process")
+                self.agent.call_op(
+                    self.agent.agent_address, 'acq', 'start'
+                )
             return True, "Already Initialized Module"
 
         with self.lock.acquire_timeout(0, job='init') as acquired:
@@ -57,8 +66,14 @@ class LS240_Agent:
             print("Initialized Lakeshore module: {!s}".format(self.module))
             session.add_message("Lakeshore initialized with ID: %s"%self.module.inst_sn)
 
-
         self.initialized = True
+
+        if start_acq:
+            self.log.info("Starting acq process")
+            self.agent.call_op(
+                self.agent.agent_address, 'acq', 'start'
+            )
+
         return True, 'Lakeshore module initialized.'
 
     def set_values(self, session, params=None):
@@ -160,7 +175,10 @@ class LS240_Agent:
         if params is None:
             params = {}
 
-        f_sample = params.get('sampling_frequency', 2.5)
+        f_sample = params.get('sampling_frequency')
+        # If f_sample is None, use value passed to Agent init
+        if f_sample is None:
+            f_sample = self.f_sample
         sleep_time = 1/f_sample - 0.01
 
         # Checks if all channel names are unique
@@ -189,12 +207,13 @@ class LS240_Agent:
                 }
 
                 for chan in self.module.channels:
-                    data['data'][chan.name + ' T'] = chan.get_reading(unit='K')
-                    data['data'][chan.name + ' V'] = chan.get_reading(unit='S')
-
-                time.sleep(sleep_time)
+                    stream_prefix = "channel_{}".format(chan.channel_num)
+                    data['data'][stream_prefix + ' T'] = chan.get_reading(unit='K')
+                    data['data'][stream_prefix + ' V'] = chan.get_reading(unit='S')
 
                 self.agent.publish_to_feed('temperatures', data)
+
+                time.sleep(sleep_time)
 
             self.agent.feeds['temperatures'].flush_buffer()
 
@@ -210,34 +229,37 @@ class LS240_Agent:
         else:
             return False, 'acq is not currently running'
 
-if __name__ == '__main__':
+
+def main():
     parser = site_config.add_arguments()
 
     # Add options specific to this agent.
     pgroup = parser.add_argument_group('Agent Options')
     pgroup.add_argument('--serial-number')
     pgroup.add_argument('--port')
-    pgroup.add_argument('--num-channels', default='2')
     pgroup.add_argument('--mode')
-    pgroup.add_argument('--fake-data', default='0')
+    pgroup.add_argument('--sampling-frequency')
 
-    # Parse command line.
+    #Not used anymore, but we don't it to break the agent if these args are passed
+    pgroup.add_argument('--fake-data')
+    pgroup.add_argument('--num-channels')
+
     args = parser.parse_args()
+    if args.fake_data is not None:
+        print("WARNING: the --fake-data parameter is deprecated, please remove"
+              "your site-config file")
+
+    if args.num_channels is not None:
+        print("WARNING: the --num-channels parameter is deprecated, please remove"
+              "your site-config file")
 
     # Interpret options in the context of site_config.
     site_config.reparse_args(args, 'Lakeshore240Agent')
 
-    num_channels = int(args.num_channels)
-    fake_data = int(args.fake_data)
-
-    # Finds usb-port for device
-    # This should work for devices with the cp210x driver
-
+    device_port = None
     if args.port is not None:
         device_port = args.port
-    else:
-
-        device_port = ""
+    else:  # Tries to find correct USB port automatically
 
         # This exists if udev rules are setup properly for the 240s
         if os.path.exists('/dev/{}'.format(args.serial_number)):
@@ -251,19 +273,35 @@ if __name__ == '__main__':
                     print("Found port {}".format(device_port))
                     break
 
-    if device_port:
-        agent, runner = ocs_agent.init_site_agent(args)
+    if device_port is None:
+        print("Could not find device port for {}".format(args.serial_number))
+        return
 
-        therm = LS240_Agent(agent, port=device_port)
+    agent, runner = ocs_agent.init_site_agent(args)
 
-        init_on_start = args.mode == 'init'
-        agent.register_task('init_lakeshore', therm.init_lakeshore_task,
-                            startup = args.mode =='init')
-        agent.register_task('set_values', therm.set_values)
-        agent.register_task('upload_cal_curve', therm.upload_cal_curve)
-        agent.register_process('acq', therm.start_acq, therm.stop_acq)
+    kwargs = {
+        'port': device_port
+    }
+    if args.sampling_frequency is not None:
+        kwargs['f_sample'] = float(args.sampling_frequency)
 
-        runner.run(agent, auto_reconnect=True)
+    therm = LS240_Agent(agent, **kwargs)
 
-    else:
-        print("Could not find device with sn {}".format(args.serial_number))
+    init_startup = False
+    if args.mode == 'init':
+        init_startup = True
+    elif args.mode == 'acq':
+        init_startup = {'start_acq': True}
+
+    agent.register_task('init_lakeshore', therm.init_lakeshore_task,
+                        startup=init_startup)
+    agent.register_task('set_values', therm.set_values)
+    agent.register_task('upload_cal_curve', therm.upload_cal_curve)
+    agent.register_process('acq', therm.start_acq, therm.stop_acq)
+
+    runner.run(agent, auto_reconnect=True)
+
+
+if __name__ == '__main__':
+    main()
+
