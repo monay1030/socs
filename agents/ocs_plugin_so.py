@@ -14,5 +14,6 @@ for n,f in [
         ('Keithley2230G-PSU', 'keithley2230G-psu/keithley_agent.py'),
         ('PysmurfController', 'smurf/pysmurf_control.py'),
         ('BlueforsAgent', 'bluefors/bluefors_log_tracker.py')
+        ('LabJackT7Agent', 'labjackt7/labjackt7_agent.py')
 ]:
     ocs.site_config.register_agent_class(n, os.path.join(root, f))
